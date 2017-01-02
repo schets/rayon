@@ -8,11 +8,14 @@ use log::Event::*;
 use rand::{self, Rng};
 use sleep::Sleep;
 use std::cell::{Cell, UnsafeCell};
+use std::collections::VecDeque;
 use std::env;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, Once, ONCE_INIT};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::thread;
 use std::mem;
+use std::ptr;
 use std::u32;
 use std::usize;
 use unwind;
@@ -209,6 +212,9 @@ struct ThreadInfo {
 
     /// the "stealer" half of the worker's deque
     stealer: Stealer<JobRef>,
+
+    /// Pointer to the current worker
+    refill: AtomicBool,
 }
 
 impl ThreadInfo {
@@ -217,6 +223,7 @@ impl ThreadInfo {
             primed: LockLatch::new(),
             stopped: LockLatch::new(),
             stealer: stealer,
+            refill: AtomicBool::new(true),
         }
     }
 }
@@ -232,6 +239,12 @@ pub struct WorkerThread {
     rng: UnsafeCell<rand::XorShiftRng>,
 
     registry: Arc<Registry>,
+
+    /// Holds the set of local jobs
+    local: UnsafeCell<VecDeque<JobRef>>,
+
+    /// Flag set when there aren't enough jobs in the stealable deque
+    refill: Cell<*const AtomicBool>,
 }
 
 // This is a bit sketchy, but basically: the WorkerThread is
@@ -275,15 +288,23 @@ impl WorkerThread {
 
     #[inline]
     pub unsafe fn push(&self, job: JobRef) {
-        self.worker.push(job);
-        self.registry.sleep.tickle(self.index);
+        let local = &mut *self.local.get();
+        local.push_front(job);
+        // Only tickle when we refill jobs since otherwise
+        // there won't be any reason to tickle stealers
+        if (*self.refill.get()).load(Ordering::Relaxed) {
+            self.refill_stealable();
+            self.registry.sleep.tickle(self.index);
+        }
     }
 
     /// Pop `job` from top of stack, returning `false` if it has been
     /// stolen.
     #[inline]
     pub unsafe fn pop(&self) -> Option<JobRef> {
-        self.worker.pop()
+        let local = &mut *self.local.get();
+        let rval = local.pop_front();
+        if rval.is_none() { self.worker.pop() } else { rval }
     }
 
     /// Wait until the latch is set. Try to keep busy by popping and
@@ -372,7 +393,10 @@ impl WorkerThread {
                 let victim = &self.registry.thread_infos[victim_index];
                 loop {
                     match victim.stealer.steal() {
-                        Stolen::Empty => return None,
+                        Stolen::Empty => {
+                            victim.refill.store(true, Ordering::Relaxed);
+                            return None;
+                        },
                         Stolen::Abort => (), // retry
                         Stolen::Data(v) => {
                             log!(StoleWork { worker: self.index, victim: victim_index });
@@ -383,20 +407,38 @@ impl WorkerThread {
             })
             .next()
     }
+
+    #[cold]
+    unsafe fn refill_stealable(&self) {
+        /// This is suboptimal since races could result in spurious refills
+        let local = &mut *self.local.get();
+        for _ in 0..5 {
+            if let Some(jr) = local.pop_back() {
+                self.worker.push(jr);
+            }
+            else {
+                break;
+            }
+        }
+        (*self.refill.get()).store(false, Ordering::Relaxed);
+    }
 }
 
 /// ////////////////////////////////////////////////////////////////////////
 
 unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usize) {
-    let worker_thread = WorkerThread {
+    let mut worker_thread = WorkerThread {
         worker: worker,
         index: index,
         rng: UnsafeCell::new(rand::weak_rng()),
         registry: registry.clone(),
+        local: UnsafeCell::new(VecDeque::with_capacity(32)),
+        refill: Cell::new(&registry.thread_infos[index].refill),
     };
     WorkerThread::set_current(&worker_thread);
 
     // let registry know we are ready to do work
+    registry.thread_infos[index].refill.store(true, Ordering::SeqCst);
     registry.thread_infos[index].primed.set();
 
     // Worker threads should not panic. If they do, just abort, as the
